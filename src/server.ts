@@ -3,6 +3,9 @@ import { Server } from "@hocuspocus/server";
 import { MongoClient, ObjectId } from "mongodb";
 import Redis from "ioredis";
 
+type RoomEntry = { connection: any; name: string };
+const rooms = new Map<string, Map<string, RoomEntry>>();
+
 const REDIS_HOST = process.env.REDIS_HOST || "localhost";
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6382", 10);
 const REDIS_STREAM_KEY =
@@ -46,6 +49,57 @@ async function start() {
   });
 
   const server = new Server({
+    async onConnect({ documentName }) {
+      if (!rooms.has(documentName)) {
+        rooms.set(documentName, new Map());
+      }
+    },
+
+    async onDisconnect({ documentName, socketId }) {
+      const room = rooms.get(documentName);
+      if (!room) return;
+      const myId = socketId;
+      if (!myId) return;
+      room.delete(myId);
+      if (room.size === 0) {
+        rooms.delete(documentName);
+        return;
+      }
+      const exitMsg = JSON.stringify({ type: "user_exit", id: myId });
+      room.forEach(({ connection: c }) => c.sendStateless(exitMsg));
+    },
+
+    async onStateless({ payload, connection, documentName }) {
+      const msg = JSON.parse(payload);
+      const room = rooms.get(documentName);
+      if (!room) return;
+      const myId = (connection as any).socketId as string;
+
+      if (msg.type === "join") {
+        room.set(myId, { connection, name: msg.name });
+        connection.sendStateless(JSON.stringify({ type: "connected", id: myId }));
+        const users = Array.from(room.entries()).map(([id, u]) => ({ id, name: u.name }));
+        const usersMsg = JSON.stringify({ type: "room_users", users });
+        room.forEach(({ connection: c }) => c.sendStateless(usersMsg));
+      } else if (msg.type === "offer") {
+        room.get(msg.to)?.connection.sendStateless(
+          JSON.stringify({ type: "getOffer", from: myId, sdp: msg.sdp }),
+        );
+      } else if (msg.type === "answer") {
+        room.get(msg.to)?.connection.sendStateless(
+          JSON.stringify({ type: "getAnswer", from: myId, sdp: msg.sdp }),
+        );
+      } else if (msg.type === "candidate") {
+        room.get(msg.to)?.connection.sendStateless(
+          JSON.stringify({ type: "getCandidate", from: myId, candidate: msg.candidate }),
+        );
+      } else if (msg.type === "user_exit") {
+        room.delete(myId);
+        const exitMsg = JSON.stringify({ type: "user_exit", id: myId });
+        room.forEach(({ connection: c }) => c.sendStateless(exitMsg));
+      }
+    },
+
     async onLoadDocument({ documentName, document }) {
       console.log(`[onLoadDocument] Loading document: "${documentName}"`);
 
