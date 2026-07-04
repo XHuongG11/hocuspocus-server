@@ -16,3 +16,8 @@ node_modules
 #!.yarn/cache
 .pnp.*
 .gitnexus
+
+# Environment files (contain secrets — never commit)
+.env
+.env.*
+!.env.example
