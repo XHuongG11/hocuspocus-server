@@ -7,6 +7,7 @@ require("dotenv/config");
 const server_1 = require("@hocuspocus/server");
 const mongodb_1 = require("mongodb");
 const ioredis_1 = __importDefault(require("ioredis"));
+const rooms = new Map();
 const REDIS_HOST = process.env.REDIS_HOST || "localhost";
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6382", 10);
 const REDIS_STREAM_KEY = process.env.REDIS_STREAM_KEY || "roadmap-document-updates";
@@ -22,6 +23,7 @@ async function start() {
     }
     catch (e) {
         console.error("Mongo connect error:", e);
+        process.exit(1);
     }
     const db = mongo.db("roadmap_service");
     // --- Redis connection ---
@@ -42,6 +44,61 @@ async function start() {
         console.error("Redis connection error:", err.message);
     });
     const server = new server_1.Server({
+        async onConnect({ documentName }) {
+            if (!rooms.has(documentName)) {
+                rooms.set(documentName, new Map());
+            }
+        },
+        async onDisconnect({ documentName, socketId }) {
+            const room = rooms.get(documentName);
+            if (!room)
+                return;
+            const myId = socketId;
+            if (!myId)
+                return;
+            room.delete(myId);
+            if (room.size === 0) {
+                rooms.delete(documentName);
+                return;
+            }
+            const exitMsg = JSON.stringify({ type: "user_exit", id: myId });
+            room.forEach(({ connection: c }) => c.sendStateless(exitMsg));
+        },
+        async onStateless({ payload, connection, documentName }) {
+            let msg;
+            try {
+                msg = JSON.parse(payload);
+            }
+            catch (e) {
+                console.error("[onStateless] Malformed payload, ignoring:", payload);
+                return;
+            }
+            const room = rooms.get(documentName);
+            if (!room)
+                return;
+            const myId = connection.socketId;
+            if (msg.type === "join") {
+                room.set(myId, { connection, name: msg.name });
+                connection.sendStateless(JSON.stringify({ type: "connected", id: myId }));
+                const users = Array.from(room.entries()).map(([id, u]) => ({ id, name: u.name }));
+                const usersMsg = JSON.stringify({ type: "room_users", users });
+                room.forEach(({ connection: c }) => c.sendStateless(usersMsg));
+            }
+            else if (msg.type === "offer") {
+                room.get(msg.to)?.connection.sendStateless(JSON.stringify({ type: "getOffer", from: myId, sdp: msg.sdp }));
+            }
+            else if (msg.type === "answer") {
+                room.get(msg.to)?.connection.sendStateless(JSON.stringify({ type: "getAnswer", from: myId, sdp: msg.sdp }));
+            }
+            else if (msg.type === "candidate") {
+                room.get(msg.to)?.connection.sendStateless(JSON.stringify({ type: "getCandidate", from: myId, candidate: msg.candidate }));
+            }
+            else if (msg.type === "user_exit") {
+                room.delete(myId);
+                const exitMsg = JSON.stringify({ type: "user_exit", id: myId });
+                room.forEach(({ connection: c }) => c.sendStateless(exitMsg));
+            }
+        },
         async onLoadDocument({ documentName, document }) {
             console.log(`[onLoadDocument] Loading document: "${documentName}"`);
             // Diagnostic: check what _id type is actually stored in MongoDB
@@ -118,21 +175,25 @@ async function start() {
             document.transact(() => {
                 metaMap.set("name", roadmap.name);
                 // console.log("roadmap.nodes:", roadmap.nodes);
-                roadmap.nodes.forEach((node) => {
+                (roadmap.nodes ?? []).forEach((node) => {
                     nodesMap.set(node.nodeId, node);
                 });
                 // console.log("roadmap.edges:", roadmap.edges);
-                roadmap.edges.forEach((edge) => {
+                (roadmap.edges ?? []).forEach((edge) => {
                     edgesMap.set(edge.edgeId, edge);
                 });
+                // category is optional (e.g. AI-generated roadmaps are uncategorized);
+                // guard against null so hydration never aborts and leaves a blank editor.
                 roadmapInfo.set("roadmapInfo", {
                     name: roadmap.name,
                     description: roadmap.description,
-                    category: {
-                        id: roadmap.category.id,
-                        name: roadmap.category.name,
-                        description: roadmap.category.description,
-                    },
+                    category: roadmap.category
+                        ? {
+                            id: roadmap.category.id,
+                            name: roadmap.category.name,
+                            description: roadmap.category.description,
+                        }
+                        : null,
                 });
             });
             console.log("Loaded roadmap into document:", document.toJSON());

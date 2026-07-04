@@ -23,6 +23,7 @@ async function start() {
     console.log("Mongo connected OK");
   } catch (e) {
     console.error("Mongo connect error:", e);
+    process.exit(1);
   }
   const db = mongo.db("roadmap_service");
 
@@ -70,7 +71,13 @@ async function start() {
     },
 
     async onStateless({ payload, connection, documentName }) {
-      const msg = JSON.parse(payload);
+      let msg: any;
+      try {
+        msg = JSON.parse(payload);
+      } catch (e) {
+        console.error("[onStateless] Malformed payload, ignoring:", payload);
+        return;
+      }
       const room = rooms.get(documentName);
       if (!room) return;
       const myId = (connection as any).socketId as string;
@@ -191,24 +198,28 @@ async function start() {
         metaMap.set("name", roadmap.name);
 
         // console.log("roadmap.nodes:", roadmap.nodes);
-        roadmap.nodes.forEach((node: any) => {
+        (roadmap.nodes ?? []).forEach((node: any) => {
           nodesMap.set(node.nodeId, node);
         });
 
         // console.log("roadmap.edges:", roadmap.edges);
 
-        roadmap.edges.forEach((edge: any) => {
+        (roadmap.edges ?? []).forEach((edge: any) => {
           edgesMap.set(edge.edgeId, edge);
         });
 
+        // category is optional (e.g. AI-generated roadmaps are uncategorized);
+        // guard against null so hydration never aborts and leaves a blank editor.
         roadmapInfo.set("roadmapInfo", {
           name: roadmap.name,
           description: roadmap.description,
-          category: {
-            id: roadmap.category.id,
-            name: roadmap.category.name,
-            description: roadmap.category.description,
-          },
+          category: roadmap.category
+            ? {
+                id: roadmap.category.id,
+                name: roadmap.category.name,
+                description: roadmap.category.description,
+              }
+            : null,
         });
       });
       console.log("Loaded roadmap into document:", document.toJSON());
